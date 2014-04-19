@@ -1,0 +1,262 @@
+```{r setup, echo=FALSE, include=FALSE, cache=FALSE}
+# Set up the environment
+library(knitr) 
+opts_chunk$set(cache.path='cache/', fig.path='img/', cache=T, tidy=T, fig.keep='high', echo=T, dpi=300, out.width=700, echo=F)
+options(replace.assign=TRUE, width=120)
+set.seed(1)
+```
+
+```{r loadLibraries, warning=FALSE, message=FALSE}
+library(biomaRt)
+# Use the latest biomart version for mm
+mart <- useMart("ensembl", dataset="mmusculus_gene_ensembl")
+library(gridExtra)
+annotDb <- "org.Mm.eg.db"
+library(package=annotDb, character.only=T)
+library(GO.db)
+library(GOstats)
+library(reactome.db)
+# Preparing environment for remapping Gene Symbols to Entrez IDs
+x <- org.Mm.egSYMBOL2EG
+# Get the entrez gene identifiers that are mapped to a gene symbol
+mapped_genes <- mappedkeys(x)
+# Convert to a list
+xx <- as.list(x[mapped_genes])
+```
+
+```{r biomart}
+refseq2gene <- function(x, fileName) {
+  # Function to convert NM_ IDs to gene names/descriptions
+  genes <- getBM(attributes=c('external_gene_id', 'description'), filters='refseq_mrna', values=x, mart=mart, uniqueRows=T)
+  if (!is.null(fileName)) {
+    write.table(genes, paste("results//", fileName, sep=""), sep="\t", row.names=F)
+  }
+  return(genes)
+}
+ens2gene <- function(x, fileName=NULL) {
+  # Function to convert NM_ IDs to gene names/descriptions
+  genes <- getBM(attributes=c('external_gene_id', 'description'), filters='ensembl_gene_id', values=x, mart=mart, uniqueRows=T)
+  if (!is.null(fileName)) {
+    write.table(genes, paste("results//", fileName, sep=""), sep="\t", row.names=F)
+  }
+  return(genes)
+}
+
+gene2gene <- function(x, fileName=NULL) {
+  # Function to convert NM_ IDs to gene names/descriptions
+  genes <- getBM(attributes=c('external_gene_id', 'description'), filters='wikigene_name', values=x, mart=mart, uniqueRows=T)
+  if (!is.null(fileName)) {
+    write.table(genes, paste("results//", fileName, sep=""), sep="\t", row.names=F)
+  }
+  return(genes)
+}
+```
+
+```{r Enrichment, echo=FALSE}
+# Perform GO enrichment analysis of topTable produced by limma.
+# use use for KEGG of GO enrichment analyses
+# Provide which ontology space to use, "MF", "BP", of "CC"
+# Returns a list of the results, and total count of significant enrichments
+Enrichment <- function(res, use="GO", fileName=NULL, ont="BP")
+{
+  res.genes <- res
+  # Convert selected and all gene names to Entrez IDs, removing NAs
+  sel.entrez <- unlist(xx)[res.genes]; sel.entrez <- sel.entrez[!is.na(sel.entrez)]
+  all.entrez <- unlist(xx) # All Entrez genes
+  # Prepare parameters for the enrichment analysis
+  if (use == "GO")
+    {
+    params <- new('GOHyperGParams', geneIds=sel.entrez, universeGeneIds=all.entrez, ontology=ont,
+ pvalueCutoff=0.05, conditional=F, testDirection='over', annotation=annotDb)
+    }
+ else
+   {
+    params <- new('KEGGHyperGParams', geneIds=sel.entrez, universeGeneIds=all.entrez, pvalueCutoff=0.05, testDirection='over', annotation=annotDb) 
+   }
+  hgOver <- hyperGTest(params)
+  result <- summary(hgOver)
+  result <- cbind(result, p.adjust(result$Pvalue, method="BH")) # Append corrected for multiple testing p-value
+  colnames(result)[length(colnames(result))] <- "p.adj"
+  result <- result[result$p.adj < 0.1, ] # Subset the results keeping FDR at 10%
+  if (!is.null(fileName)) {
+    write.table(result, paste("results//", fileName, sep=""), sep="\t", row.names=F)
+  }
+  return(list(result, nrow(result)))
+}
+```
+
+```{r reactomeEnrichment, echo=FALSE}
+# Perform Reactome pathway enrichment analysis of topTable produced by limma
+# Returns a list of the results, and total count of significant enrichments
+reactomeEnrichment <- function(res, fileName=NULL)
+{
+  # Convert selected and all gene names to Entrez IDs, removing NAs
+  sel.entrez <- unlist(xx)[res]; sel.entrez <- sel.entrez[!is.na(sel.entrez)]
+  all.entrez <- unlist(xx); all.entrez <- all.entrez[!is.na(all.entrez)]
+  # Prepare pathways and counts
+  entrez2path <- as.list(reactomeEXTID2PATHID) # EntrezIDs to pathway IDs mapping
+  sel.counts <- table(unlist(entrez2path[sel.entrez])) # Selected gene counts in pathways
+  all.counts <- table(unlist(entrez2path[all.entrez])) # All gene counts
+  n.sel <- length(sel.entrez) # Total number of selected genes
+  n.all <- length(all.entrez) # Total number of all genes
+  pathways <- names(sel.counts) # PAthways to test for enrichment
+  pathway.names <- as.list(reactomePATHID2NAME) # Pathway ID to name mapping
+  # For each pathway, construct 2x2 contingency table and calculate the enrichment p-value using Fisher's exact test
+  result <- lapply(pathways, function(p) 
+  {
+                   sel <- sel.counts[[p]] 
+                   all <- all.counts[[p]]
+                   pathway.name <- pathway.names[[p]]
+                   m <- matrix(c(sel, all, n.sel-sel, n.all-all),
+                               byrow=T,nrow=2)
+                   p.value <- fisher.test(m, alternative="greater")$p.value
+                   data.frame(PathwayID=p, 
+                              Pathway=pathway.name,
+                              N.Selected=sel,
+                              N.In.Category=all,
+                              p.value=p.value)
+  }
+  ) # End lapply
+  result <- as.data.frame(do.call(rbind, result)) # Convert list to data frame
+  result <- result[order(result$p.value),] # Order by p-value
+  result <- cbind(result, p.adjust(result$p.value, method="BH")) # Append corrected for multiple testing p-value
+  colnames(result)[length(colnames(result))] <- "p.adj"
+  # result <- result[result$p.adj < 0.1, ] # Subset the results keeping FDR at 10%
+  if (!is.null(fileName)) {
+    write.table(result, paste("results//", fileName, sep=""), sep="\t", row.names=F)
+  }
+  return(list(result, sum(result$p.adj < 0.05)))
+}
+```
+
+```{r GO}
+GOKEGG <- function(x, use="GO", filename=NULL) {
+  res.go <- Enrichment(x[, 1], use, fileName=filename)
+  message("The number of enriched ", use, " :", res.go[[2]])
+  if (res.go[[2]] > 20) {i <- 20} else {i <- res.go[[2]]}
+  if (i > 0) {grid.table(res.go[[1]][1:i, ], gp=gpar(fontsize=7))}
+}
+```
+
+```{r Pathway}
+Pathway <- function(x, filename=NULL) {
+  res.pathway <- reactomeEnrichment(x[, 1], filename)
+  message("The number of enriched Reactome pathways:", res.pathway[[2]])
+  if (res.pathway[[2]] > 20) {i <- 20} else {i <- res.pathway[[2]]}
+  if (i > 0) {grid.table(res.pathway[[1]][1:i, ], gp=gpar(fontsize=7))}
+}
+```
+
+Analysis of mutated genes
+========================================================
+
+```{r prepareData}
+source("venn4.R")
+source("venn5.R")
+datadir <- "../results/"
+gene.list <- list.files(datadir, pattern="genes*")
+#"genes_NZB-X_2758-1_2410-3_2328-3.txt"
+#"genes_NZB-X_2758-1_2410-X_2328-3.txt"
+#"genes_NZB-X_2758-3_2410-1_2328-1.txt"
+#"genes_NZB-X_2758-3_2410-X_2328-1.txt"
+```
+
+We are analyzing `r gene.list` gene lists. 
+
+"X" indicates we do not care about a mutation in that particular mouse (e.g., NZB-X indicates the status of a mutation in the NZB mouse is not important). "1" indicates that, for a given mouse, this is a wild-type mutation (same as reference). "3" indicates reliably detected non-wild type mutation. "2" is uncertain detection, and is not considered here.
+
+```{r loadData}
+genes <- lapply(paste("../results", gene.list, sep="/"), function(x) read.table(x, sep="\t"))
+names(genes) <- gene.list
+
+# returns string w/o leading whitespace
+trim.leading <- function (x)  sub("^\\s+", "", x)
+# returns string w/o trailing whitespace
+trim.trailing <- function (x) sub("\\s+$", "", x)
+# returns string w/o leading or trailing whitespace
+trim <- function (x) gsub("^\\s+|\\s+$", "", x)
+
+# Function to clean gene lsit
+cleanGeneList <- function(x) {
+  x <- sapply(x, trim.leading) # Remove leading spaces
+  # Some have multiple gene names - split by space and get unique
+  x <- unique(unlist(sapply(x, function(x) strsplit(x, " "))))
+  x <- x[x != "N/A" & x != "NULL"] # Remove N/A or NULL entries
+  return(x)
+}
+
+genes.133 <- cleanGeneList(as.character(genes[[1]][, 2]))
+genes.1X3 <- cleanGeneList(as.character(genes[[2]][, 2]))
+genes.311 <- cleanGeneList(as.character(genes[[3]][, 2]))
+genes.3X1 <- cleanGeneList(as.character(genes[[4]][, 2]))
+```
+
+```{r vennDiagram}
+# Function to convert named list of gene sets into a table for venn diagram
+vennTable <- function(x){
+  genes.all <- Reduce(union, x) # All genes
+  # Matrix with 0, sixe of all genes X gene sets
+  vennTable <- matrix(data=0, nrow=length(genes.all), ncol=length(x), dimnames=list(genes.all, names(x)))
+  for (i in 1:length(x)){
+    vennTable[x[[i]], i] <- 1 # Fill gene set-specific columns with 1
+  }
+  return(vennTable)
+}
+```
+
+First, we check how, for example, 1X3 and 133 gene lists overlap. The latter contains more stringent mutation selection, hence, 133 gene list should be a subset of the more relaxed 1X3 gene list.
+
+```{r venn133vs1X3}
+vennDiagram(vennTable(list("1X3"=genes.1X3, "133"=genes.133)))
+```
+
+Yes, the second list is a subset of the first one.
+
+Comparing 133 vs 311 gene sets
+-------------------------------
+Now, we compare gene sets mutated in 2410 & 2328 mice (133 list) with genes mutated in 2756 mouse (311 list).
+
+```{r venn133vs311}
+table.133vs311 <- vennTable(list("133"=genes.133, "311"=genes.311))
+vennDiagram(table.133vs311)
+```
+
+We see that `r nrow(table.133vs311[rowSums(table.133vs311) == ncol(table.133vs311), ])` genes have mutations in both conditions.
+
+Next step:
+
+1) All condition-specific genes, without caring for overlap? E.g., 220 genes for "133" condition vs. 230 genes for "311" condition.
+
+2) Unique for a condition genes, e.g., 140 vs. 150 genes?
+
+3) Genes mutated in both conditions (`r nrow(table.133vs311[rowSums(table.133vs311) == ncol(table.133vs311), ])` genes)?
+
+4) All the above? 
+
+Genes mutated in both conditions (`r nrow(table.133vs311[rowSums(table.133vs311) == ncol(table.133vs311), ])` genes)
+=====================================================================================================================
+The genes mutated in both conditions were mapped to gene names and descriptions. Some may have synonyms, thus, multiple genes may resolve to a single gene name. This is why the dable shows less than 80 number of genes
+
+
+```{r 133and311, fig.height=16}
+genes.133and311 <- gene2gene(rownames(table.133vs311[rowSums(table.133vs311) == ncol(table.133vs311), ]), "genes.133and311.txt")
+grid.table(genes.133and311, gp=gpar(fontsize=7))
+```
+
+Enriched gene ontologies
+-------------------------
+```{r GO.133and311, fig.height=5}
+GOKEGG(genes.133and311, use="GO", "GO.133and311.txt")
+```
+
+Enriched KEGG pathways
+----------------------
+```{r KEGG.133and311, fig.height=2}
+GOKEGG(genes.133and311, use="KEGG", "KEGG.133and311.txt")
+```
+
+Enriched Reactome pathways
+--------------------------
+```{r Reactome.133and311, fig.height=1}
+Pathway(genes.133and311, "Reactome.133and311.txt")
+```
